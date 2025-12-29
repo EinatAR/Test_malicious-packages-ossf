@@ -1,0 +1,19 @@
+connector:
+  id: "REPLACE-ME-WITH-UUID"
+  type: "EXTERNAL_IMPORT"
+  name: "OSSF Malicious Packages"
+  scope: "Indicator,Stix-Cyber-Observable"
+  confidence_level: 80
+  log_level: "info"
+
+opencti:
+  url: "https://your-opencti-url"
+  token: "YOUR_OPENCTI_API_TOKEN"
+
+ossf:
+  github_repo_url: "https://github.com/ossf/malicious-packages.git"
+  branch: "main"
+  local_repo_path: "/opt/ossf-malicous-packages-repo"
+  run_interval_seconds: 86400        # run daily
+  default_score: 80
+  source_name: "ossf/malicious-packages"
