@@ -3,16 +3,16 @@ import time
 import json
 import logging
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 
-from pycti import OpenCTIConnectorHelper, get_config_variable
 import stix2
+from pycti import OpenCTIConnectorHelper, get_config_variable
 
 
 class OSSFMaliciousPackagesConnector:
     def __init__(self):
-        # Load config from environment / yaml
+        # Load config from file + env
         config = self._load_config()
         self.helper = OpenCTIConnectorHelper(config)
 
@@ -24,7 +24,9 @@ class OSSFMaliciousPackagesConnector:
             "OSSF_GITHUB_BRANCH", ["ossf", "branch"], config, default="main"
         )
         self.local_repo_path = get_config_variable(
-            "OSSF_LOCAL_REPO_PATH", ["ossf", "local_repo_path"], config,
+            "OSSF_LOCAL_REPO_PATH",
+            ["ossf", "local_repo_path"],
+            config,
             default="/opt/ossf-malicous-packages-repo",
         )
         self.run_interval = int(
@@ -37,10 +39,7 @@ class OSSFMaliciousPackagesConnector:
         )
         self.default_score = int(
             get_config_variable(
-                "OSSF_DEFAULT_SCORE",
-                ["ossf", "default_score"],
-                config,
-                default=80,
+                "OSSF_DEFAULT_SCORE", ["ossf", "default_score"], config, default=80
             )
         )
         self.source_name = get_config_variable(
@@ -50,16 +49,19 @@ class OSSFMaliciousPackagesConnector:
             default="ossf/malicious-packages",
         )
 
-        self.logger = self.helper.log_info
+        self.helper.log_info("OSSF Malicious Packages connector initialized")
 
     @staticmethod
     def _load_config() -> Dict[str, Any]:
-        # Standard way if you use the template loader,
-        # or inline YAML load, depending on your deployment.
+        """
+        Load connector config from config.yml placed next to this file.
+        In a real deployment, you might use the standard OpenCTI template loader instead.
+        """
         import yaml
 
-        config_file_path = os.path.join(os.path.dirname(__file__), "config.yml")
-        with open(config_file_path, "r") as f:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        config_path = os.path.join(base_dir, "config.yml")
+        with open(config_path, "r") as f:
             return yaml.safe_load(f)
 
     # -------------------------------------------------------------------------
@@ -67,17 +69,32 @@ class OSSFMaliciousPackagesConnector:
     # -------------------------------------------------------------------------
 
     def _init_or_update_repo(self) -> None:
-        """Clone or update the local repo."""
+        """Clone or update the local ossf/malicious-packages repo."""
         if not os.path.isdir(self.local_repo_path):
-            self.helper.log_info(f"Cloning {self.github_repo_url} to {self.local_repo_path}")
+            self.helper.log_info(
+                f"Cloning {self.github_repo_url} into {self.local_repo_path}"
+            )
             subprocess.check_call(
-                ["git", "clone", "--branch", self.github_branch, self.github_repo_url, self.local_repo_path]
+                [
+                    "git",
+                    "clone",
+                    "--branch",
+                    self.github_branch,
+                    self.github_repo_url,
+                    self.local_repo_path,
+                ]
             )
         else:
             self.helper.log_info(f"Updating repo in {self.local_repo_path}")
-            subprocess.check_call(["git", "-C", self.local_repo_path, "fetch", "origin"])
-            subprocess.check_call(["git", "-C", self.local_repo_path, "checkout", self.github_branch])
-            subprocess.check_call(["git", "-C", self.local_repo_path, "pull", "origin", self.github_branch])
+            subprocess.check_call(
+                ["git", "-C", self.local_repo_path, "fetch", "origin"]
+            )
+            subprocess.check_call(
+                ["git", "-C", self.local_repo_path, "checkout", self.github_branch]
+            )
+            subprocess.check_call(
+                ["git", "-C", self.local_repo_path, "pull", "origin", self.github_branch]
+            )
 
     def _get_current_head(self) -> str:
         result = subprocess.check_output(
@@ -85,13 +102,14 @@ class OSSFMaliciousPackagesConnector:
         )
         return result.decode().strip()
 
-    def _get_changed_files(self, old_commit: Optional[str], new_commit: str) -> List[str]:
+    def _get_changed_files(
+        self, old_commit: Optional[str], new_commit: str
+    ) -> List[str]:
         """
-        Return list of paths to JSON files under osv/malicious/** changed between
-        old_commit and new_commit. If old_commit is None, return all.
+        Return list of JSON files under osv/malicious/** that changed
+        between old_commit and new_commit. If old_commit is None, return all.
         """
         if old_commit is None:
-            # first run: process all malicious JSONs
             malicious_dir = os.path.join(self.local_repo_path, "osv", "malicious")
             changed_files = []
             for root, _, files in os.walk(malicious_dir):
@@ -111,7 +129,7 @@ class OSSFMaliciousPackagesConnector:
             "osv/malicious",
         ]
         output = subprocess.check_output(diff_cmd).decode().splitlines()
-        # Prepend repo path
+
         changed_files = [
             os.path.join(self.local_repo_path, p)
             for p in output
@@ -121,19 +139,20 @@ class OSSFMaliciousPackagesConnector:
 
     def _build_github_blob_url(self, file_path: str, commit: str) -> str:
         """
-        Convert local file path to GitHub blob URL for that commit.
-        Assumes repo layout: <local_repo_path>/<relative_path>
-        and URL: https://github.com/ossf/malicious-packages/blob/<commit>/<relative_path>
+        Build a GitHub blob URL for a local file at a given commit.
+        Example:
+          https://github.com/ossf/malicious-packages/blob/<commit>/osv/malicious/...
         """
-        # Normalise and remove local repo prefix
         rel_path = os.path.relpath(file_path, self.local_repo_path).replace("\\", "/")
-        return f"{self.github_repo_url.replace('.git', '')}/blob/{commit}/{rel_path}"
+        base = self.github_repo_url.replace(".git", "")
+        return f"{base}/blob/{commit}/{rel_path}"
 
     # -------------------------------------------------------------------------
-    # OSV parsing → File + Indicator
+    # OSV parsing and hash extraction
     # -------------------------------------------------------------------------
 
     def _parse_osv_json(self, file_path: str) -> Optional[Dict[str, Any]]:
+        """Parse a single OSV JSON file into a simplified structure."""
         try:
             with open(file_path, "r") as f:
                 data = json.load(f)
@@ -141,7 +160,6 @@ class OSSFMaliciousPackagesConnector:
             self.helper.log_error(f"Error reading OSV JSON {file_path}: {e}")
             return None
 
-        # We assume standard OSV schema. Important fields:
         osv_id = data.get("id")
         summary = data.get("summary")
         affected = data.get("affected", [])
@@ -150,14 +168,10 @@ class OSSFMaliciousPackagesConnector:
             self.helper.log_info(f"No 'affected' section in {file_path}, skipping")
             return None
 
-        # For now, we just take the first affected package
         pkg_info = affected[0].get("package", {})
         ecosystem = pkg_info.get("ecosystem", "unknown")
         name = pkg_info.get("name", "unknown")
 
-        # Hashes may be stored in ecosystem-specific ways.
-        # For this first version, we assume they are in a 'database_specific' or
-        # 'artifacts' section. Adjust this to match the actual repo format.
         hashes = self._extract_hashes_from_osv(data)
         if not hashes:
             self.helper.log_info(f"No hashes found in {file_path}, skipping")
@@ -168,154 +182,156 @@ class OSSFMaliciousPackagesConnector:
             "summary": summary,
             "ecosystem": ecosystem,
             "package": name,
-            "hashes": hashes,
+            "hashes": hashes,  # dict algo -> list[str]
         }
 
     def _extract_hashes_from_osv(self, osv_data: Dict[str, Any]) -> Dict[str, List[str]]:
         """
-        Extract hashes from OSV entry.
+        Extract hashes from OSV entry in ossf/malicious-packages format.
 
-        Return structure:
+        We look into:
+          database_specific.malicious-packages-origins[].sha256
+
+        Returns:
           {
-            "SHA256": ["hash1", "hash2"],
-            "SHA1": ["..."],
-            "MD5": ["..."],
+            "SHA256": ["hash1", "hash2", ...]
           }
-
-        You will need to adapt this function to the actual format used by
-        ossf/malicious-packages. For now we look in a few common places.
         """
         hashes: Dict[str, List[str]] = {}
 
-        # Example: some OSV entries might store artifact info under "database_specific"
-        db_spec = osv_data.get("database_specific", {})
-        artifacts = db_spec.get("artifacts", [])
+        db_specific = osv_data.get("database_specific", {})
+        origins = db_specific.get("malicious-packages-origins", [])
 
-        for art in artifacts:
-            algo = art.get("hash", {}).get("algo")
-            value = art.get("hash", {}).get("value")
-            if algo and value:
-                algo_upper = algo.upper()
-                hashes.setdefault(algo_upper, []).append(value)
+        for origin in origins:
+            sha256 = origin.get("sha256")
+            if sha256:
+                hashes.setdefault("SHA256", []).append(sha256)
 
-        # Extend here if hashes are stored differently in the repo
+        # Deduplicate while preserving order
+        for algo, values in list(hashes.items()):
+            seen = set()
+            unique = []
+            for v in values:
+                if v not in seen:
+                    seen.add(v)
+                    unique.append(v)
+            hashes[algo] = unique
 
         return hashes
 
-    def _create_file_and_indicator_objects(
-        self,
-        parsed: Dict[str, Any],
-        github_url: str,
+    # -------------------------------------------------------------------------
+    # STIX creation (Option A: one File + one Indicator per hash)
+    # -------------------------------------------------------------------------
+
+    def _create_objects_for_entry(
+        self, parsed: Dict[str, Any], github_url: str
     ) -> List[stix2.DomainObject]:
+        """
+        For a parsed OSV entry, create:
+          - One File observable per hash
+          - One Indicator per File
+          - One 'based-on' relationship per Indicator→File
+        """
         objects: List[stix2.DomainObject] = []
 
         ecosystem = parsed["ecosystem"]
         package = parsed["package"]
-        summary = parsed.get("summary") or f"Malicious package {ecosystem}/{package}"
-
+        summary = (
+            parsed.get("summary")
+            or f"Malicious package {ecosystem}/{package}"
+        )
         name = f"{ecosystem}/{package}"
         score = self.default_score
 
-        # External reference shared by File & Indicator
+        # Shared external reference (File + Indicator)
         external_ref = stix2.ExternalReference(
             source_name=self.source_name,
             url=github_url,
             external_id=parsed.get("osv_id"),
         )
 
-        # Build File observable with multiple hashes
-        file_kwargs = {
-            "type": "file",
-            "name": name,
-            "custom_properties": {
-                "x_opencti_description": summary,
-                "x_opencti_score": score,
-                "external_references": [external_ref],
-            },
-        }
-
-        # Build the "hashes" dict for STIX2 File
-        hashes = {}
+        # For each algorithm and each value, create separate File + Indicator
         for algo, values in parsed["hashes"].items():
-            # If multiple values for same algo, pick first for 'hashes'
-            # and keep the rest in the pattern. Or we can keep all if needed.
-            if values:
-                hashes[algo] = values[0]
-        if hashes:
-            file_kwargs["hashes"] = hashes
+            for hash_value in values:
+                # --- File observable ---
+                file_kwargs = {
+                    "type": "file",
+                    "name": name,
+                    "hashes": {algo: hash_value},
+                    "custom_properties": {
+                        "x_opencti_description": summary,
+                        "x_opencti_score": score,
+                        # external_references is not a standard STIX field on SCO,
+                        # but OpenCTI allows it via custom_properties.
+                        "external_references": [external_ref],
+                    },
+                }
+                file_stix = stix2.File(**file_kwargs)
+                objects.append(file_stix)
 
-        file_stix = stix2.File(**file_kwargs)
-        objects.append(file_stix)
+                # --- Indicator ---
+                pattern = f"[file:hashes.'{algo}' = '{hash_value}']"
+                indicator = stix2.Indicator(
+                    name=name,
+                    description=summary,
+                    pattern_type="stix",
+                    pattern=pattern,
+                    valid_from=datetime.now(timezone.utc),
+                    created=datetime.now(timezone.utc),
+                    custom_properties={
+                        # mandatory best practice for indicators [1]
+                        "x_opencti_main_observable_type": "File",
+                        "x_opencti_score": score,
+                        "external_references": [external_ref],
+                    },
+                )
+                objects.append(indicator)
 
-        # Build Indicator pattern:
-        patterns = []
-
-        for algo, values in parsed["hashes"].items():
-            for v in values:
-                # Example: [file:hashes.'SHA256' = 'xxx']
-                patterns.append(f"[file:hashes.'{algo}' = '{v}']")
-
-        if not patterns:
-            return objects  # no indicator if no hashes
-
-        if len(patterns) == 1:
-            pattern = patterns[0]
-        else:
-            pattern = " OR ".join(patterns)
-
-        indicator = stix2.Indicator(
-            name=name,
-            description=summary,
-            pattern_type="stix",
-            pattern=pattern,
-            valid_from=datetime.utcnow().isoformat(timespec="seconds") + "Z",
-            custom_properties={
-                "x_opencti_score": score,
-                "x_opencti_main_observable_type": "File",
-                "external_references": [external_ref],
-            },
-        )
-        objects.append(indicator)
-
-        # based-on relationship: Indicator → File
-        rel = stix2.Relationship(
-            relationship_type="based-on",
-            source_ref=indicator.id,
-            target_ref=file_stix.id,
-        )
-        objects.append(rel)
+                # --- based-on relationship: Indicator → File ---
+                rel = stix2.Relationship(
+                    relationship_type="based-on",
+                    source_ref=indicator.id,
+                    target_ref=file_stix.id,
+                )
+                objects.append(rel)
 
         return objects
 
     # -------------------------------------------------------------------------
-    # Main run loop
+    # Main processing logic
     # -------------------------------------------------------------------------
 
     def _process_once(self) -> None:
         self.helper.log_info("Starting OSSF Malicious Packages run")
 
-        # 1. Ensure repo is up to date
+        # 1. Ensure repository is up-to-date
         self._init_or_update_repo()
         current_head = self._get_current_head()
 
         # 2. Get connector state
         state = self.helper.get_state() or {}
         last_commit = state.get("last_commit")
-        self.helper.log_info(f"Last commit in state: {last_commit}, current: {current_head}")
+        self.helper.log_info(
+            f"Last commit in state: {last_commit}, current HEAD: {current_head}"
+        )
 
-        # 3. Find changed (or all, on first run) JSONs
+        # 3. Determine which JSON files to process
         changed_files = self._get_changed_files(last_commit, current_head)
-        self.helper.log_info(f"Found {len(changed_files)} changed OSV JSON files to process")
+        self.helper.log_info(
+            f"Found {len(changed_files)} OSV JSON files to process this run"
+        )
 
         all_objects: List[stix2.DomainObject] = []
 
+        # 4. Parse each changed file and create STIX objects
         for file_path in changed_files:
             parsed = self._parse_osv_json(file_path)
             if not parsed:
                 continue
 
             github_url = self._build_github_blob_url(file_path, current_head)
-            objs = self._create_file_and_indicator_objects(parsed, github_url)
+            objs = self._create_objects_for_entry(parsed, github_url)
+
             if not objs:
                 continue
 
@@ -324,25 +340,33 @@ class OSSFMaliciousPackagesConnector:
         if not all_objects:
             self.helper.log_info("No new objects to send this run")
         else:
-            # 4. Create and send STIX bundle
+            # 5. Bundle and send to OpenCTI
             bundle = self.helper.stix2_create_bundle(all_objects)
             self.helper.send_stix2_bundle(bundle)
-            self.helper.log_info(f"Sent bundle with {len(all_objects)} objects to OpenCTI")
+            self.helper.log_info(
+                f"Sent bundle with {len(all_objects)} STIX objects to OpenCTI"
+            )
 
-        # 5. Update state
-        new_state = {"last_commit": current_head, "last_run": datetime.utcnow().isoformat() + "Z"}
+        # 6. Update connector state
+        new_state = {
+            "last_commit": current_head,
+            "last_run": datetime.now(timezone.utc).isoformat(),
+        }
         self.helper.set_state(new_state)
         self.helper.log_info(f"State updated: {new_state}")
 
     def run(self) -> None:
-        self.helper.log_info("Starting OSSF Malicious Packages connector main loop")
+        self.helper.log_info(
+            "Starting OSSF Malicious Packages connector main loop"
+        )
         while True:
             try:
                 self._process_once()
             except Exception as e:
                 self.helper.log_error(f"Error during processing: {e}")
-
-            self.helper.log_info(f"Sleeping for {self.run_interval} seconds")
+            self.helper.log_info(
+                f"Sleeping for {self.run_interval} seconds before next run"
+            )
             time.sleep(self.run_interval)
 
 
