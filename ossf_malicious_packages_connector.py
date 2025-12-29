@@ -55,7 +55,6 @@ class OSSFMaliciousPackagesConnector:
     def _load_config() -> Dict[str, Any]:
         """
         Load connector config from config.yml placed next to this file.
-        In a real deployment, you might use the standard OpenCTI template loader instead.
         """
         import yaml
 
@@ -67,7 +66,6 @@ class OSSFMaliciousPackagesConnector:
     # -------------------------------------------------------------------------
     # Git / repo utilities
     # -------------------------------------------------------------------------
-
     def _init_or_update_repo(self) -> None:
         """Clone or update the local ossf/malicious-packages repo."""
         if not os.path.isdir(self.local_repo_path):
@@ -111,7 +109,7 @@ class OSSFMaliciousPackagesConnector:
         """
         if old_commit is None:
             malicious_dir = os.path.join(self.local_repo_path, "osv", "malicious")
-            changed_files = []
+            changed_files: List[str] = []
             for root, _, files in os.walk(malicious_dir):
                 for f in files:
                     if f.endswith(".json"):
@@ -129,7 +127,6 @@ class OSSFMaliciousPackagesConnector:
             "osv/malicious",
         ]
         output = subprocess.check_output(diff_cmd).decode().splitlines()
-
         changed_files = [
             os.path.join(self.local_repo_path, p)
             for p in output
@@ -150,7 +147,6 @@ class OSSFMaliciousPackagesConnector:
     # -------------------------------------------------------------------------
     # OSV parsing and hash extraction
     # -------------------------------------------------------------------------
-
     def _parse_osv_json(self, file_path: str) -> Optional[Dict[str, Any]]:
         """Parse a single OSV JSON file into a simplified structure."""
         try:
@@ -163,7 +159,6 @@ class OSSFMaliciousPackagesConnector:
         osv_id = data.get("id")
         summary = data.get("summary")
         affected = data.get("affected", [])
-
         if not affected:
             self.helper.log_info(f"No 'affected' section in {file_path}, skipping")
             return None
@@ -188,10 +183,8 @@ class OSSFMaliciousPackagesConnector:
     def _extract_hashes_from_osv(self, osv_data: Dict[str, Any]) -> Dict[str, List[str]]:
         """
         Extract hashes from OSV entry in ossf/malicious-packages format.
-
         We look into:
           database_specific.malicious-packages-origins[].sha256
-
         Returns:
           {
             "SHA256": ["hash1", "hash2", ...]
@@ -199,10 +192,16 @@ class OSSFMaliciousPackagesConnector:
         """
         hashes: Dict[str, List[str]] = {}
 
-        db_specific = osv_data.get("database_specific", {})
-        origins = db_specific.get("malicious-packages-origins", [])
+        db_specific = osv_data.get("database_specific") or {}
+        origins = db_specific.get("malicious-packages-origins") or []
+
+        # If origins is not a list, skip
+        if not isinstance(origins, list):
+            return hashes
 
         for origin in origins:
+            if not isinstance(origin, dict):
+                continue
             sha256 = origin.get("sha256")
             if sha256:
                 hashes.setdefault("SHA256", []).append(sha256)
@@ -210,7 +209,7 @@ class OSSFMaliciousPackagesConnector:
         # Deduplicate while preserving order
         for algo, values in list(hashes.items()):
             seen = set()
-            unique = []
+            unique: List[str] = []
             for v in values:
                 if v not in seen:
                     seen.add(v)
@@ -220,26 +219,22 @@ class OSSFMaliciousPackagesConnector:
         return hashes
 
     # -------------------------------------------------------------------------
-    # STIX creation (Option A: one File + one Indicator per hash)
+    # STIX creation
     # -------------------------------------------------------------------------
-
     def _create_objects_for_entry(
         self, parsed: Dict[str, Any], github_url: str
-    ) -> List[stix2.DomainObject]:
+    ) -> List:
         """
         For a parsed OSV entry, create:
           - One File observable per hash
           - One Indicator per File
           - One 'based-on' relationship per Indicator→File
         """
-        objects: List[stix2.DomainObject] = []
+        objects: List = []
 
         ecosystem = parsed["ecosystem"]
         package = parsed["package"]
-        summary = (
-            parsed.get("summary")
-            or f"Malicious package {ecosystem}/{package}"
-        )
+        summary = parsed.get("summary") or f"Malicious package {ecosystem}/{package}"
         name = f"{ecosystem}/{package}"
         score = self.default_score
 
@@ -261,8 +256,7 @@ class OSSFMaliciousPackagesConnector:
                     "custom_properties": {
                         "x_opencti_description": summary,
                         "x_opencti_score": score,
-                        # external_references is not a standard STIX field on SCO,
-                        # but OpenCTI allows it via custom_properties.
+                        # OpenCTI allows external_references via custom_properties on SCOs
                         "external_references": [external_ref],
                     },
                 }
@@ -271,15 +265,15 @@ class OSSFMaliciousPackagesConnector:
 
                 # --- Indicator ---
                 pattern = f"[file:hashes.'{algo}' = '{hash_value}']"
+                now = datetime.now(timezone.utc)
                 indicator = stix2.Indicator(
                     name=name,
                     description=summary,
                     pattern_type="stix",
                     pattern=pattern,
-                    valid_from=datetime.now(timezone.utc),
-                    created=datetime.now(timezone.utc),
+                    valid_from=now,
+                    created=now,
                     custom_properties={
-                        # mandatory best practice for indicators [1]
                         "x_opencti_main_observable_type": "File",
                         "x_opencti_score": score,
                         "external_references": [external_ref],
@@ -300,7 +294,6 @@ class OSSFMaliciousPackagesConnector:
     # -------------------------------------------------------------------------
     # Main processing logic
     # -------------------------------------------------------------------------
-
     def _process_once(self) -> None:
         self.helper.log_info("Starting OSSF Malicious Packages run")
 
@@ -321,20 +314,17 @@ class OSSFMaliciousPackagesConnector:
             f"Found {len(changed_files)} OSV JSON files to process this run"
         )
 
-        all_objects: List[stix2.DomainObject] = []
+        all_objects: List = []
 
         # 4. Parse each changed file and create STIX objects
         for file_path in changed_files:
             parsed = self._parse_osv_json(file_path)
             if not parsed:
                 continue
-
             github_url = self._build_github_blob_url(file_path, current_head)
             objs = self._create_objects_for_entry(parsed, github_url)
-
             if not objs:
                 continue
-
             all_objects.extend(objs)
 
         if not all_objects:
