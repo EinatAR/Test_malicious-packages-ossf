@@ -30,7 +30,7 @@ The connector ingests malicious package JSONs from the repo, creates File Observ
 # **Additional Notes**
 
 - Platform creation date = Valid from
-- (Realizing sometimes there’s more than 1 hash in a package, so changing to create 1 Observable + 1 Indicator (based on the Observable) **for each hash**) -> To test
+- [Realizing sometimes there’s more than 1 hash in a package, so changing to create 1 Observable + 1 Indicator (based on the Observable) **for each hash**] -> To test
 - The connector targets only sha256 in this version
 - The external reference is included in the Indicator object
 - Connector runs every 1 hour
