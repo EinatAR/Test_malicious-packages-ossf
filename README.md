@@ -19,7 +19,7 @@ The connector ingests malicious package JSONs from the repo, creates File Observ
 | --- | --- |
 | Package name | Indicator name |
 | Summary | Description (Observable and Indicator) |
-| Score | Default (50) |
+| Score | 80 (configurable) |
 | Hash | Name for Observable, Indicator pattern for Indicator |
 | URL | External Reference (within the Indicator) |
 |  | TLP:CLEAR |
